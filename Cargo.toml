@@ -1,0 +1,16 @@
+[package]
+authors = ["Thibault Lemaire <thibault.lemaire@protonmail.com>"]
+categories = ["api-bindings", "development-tools::ffi"]
+description = "Compatibility wrappers for using async Rust from Python"
+edition = "2018"
+exclude = ["/.gitignore"]
+keywords = ["pyo3", "python", "cpython", "async", "asyncio"]
+license = "Apache-2.0"
+name = "pyo3-futures"
+readme = "README.md"
+repository = "https://gitlab.com/ThibaultLemaire/pyo3-futures"
+version = "0.2.0"
+
+[dependencies]
+futures = "0.3"
+pyo3 = "0.13"
