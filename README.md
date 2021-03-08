@@ -15,3 +15,7 @@ In the unlikely event that you don't know about it, there is an other crate, [`p
 
 `pyo3-futures` (this crate) is an exploration on a different approach: Letting Python drive the future like any other coroutine (so, on the same thread).
 Although `pyo3-asyncio` achieves runtime agnosticity through generics (you can choose between `async-std` or `tokio`), `pyo3-futures` should be more flexible in that it doesn't even have a concept of "runtime".
+
+## Examples
+
+[`sterling`](https://gitlab.com/ThibaultLemaire/sterling) is an async MongoDB client for Python that I'm developing as an example of using this crate to build async Python libraries.
