@@ -15,27 +15,19 @@ use {
 };
 
 #[pyclass]
-pub struct RustFutureWrapper {
+pub struct AwaitableRustFuture {
     future: Option<BoxFuture<'static, PyResult<PyObject>>>,
     aio_loop: Option<PyObject>,
     callbacks: Vec<(PyObject, Option<PyObject>)>,
     #[pyo3(get, set)]
     _asyncio_future_blocking: bool,
-    waker: Option<Arc<WakerClosure>>,
+    waker: Option<Arc<AsyncioWaker>>,
 }
 
-impl RustFutureWrapper {
-    fn new(
-        future: impl Future<Output = impl IntoPyCallbackOutput<PyObject>> + Send + 'static,
-    ) -> Self {
+impl AwaitableRustFuture {
+    fn new(future: BoxFuture<'static, PyResult<PyObject>>) -> Self {
         Self {
-            future: Some(
-                async move {
-                    let result = future.await;
-                    Python::with_gil(move |py| result.convert(py))
-                }
-                .boxed(),
-            ),
+            future: Some(future),
             aio_loop: None,
             callbacks: vec![],
             _asyncio_future_blocking: true,
@@ -45,19 +37,16 @@ impl RustFutureWrapper {
 }
 
 #[pyproto]
-impl PyAsyncProtocol for RustFutureWrapper {
+impl PyAsyncProtocol for AwaitableRustFuture {
     fn __await__(slf: Py<Self>) -> PyResult<Py<Self>> {
-        let py_future = slf.clone();
+        let wrapper = slf.clone();
         Python::with_gil(|py| -> PyResult<_> {
             let mut slf = slf.try_borrow_mut(py)?;
             let aio_loop: PyObject = PyModule::import(py, "asyncio")?
                 .call0("get_running_loop")?
                 .into();
             slf.aio_loop = Some(aio_loop.clone());
-            slf.waker = Some(Arc::new(WakerClosure {
-                aio_loop,
-                py_future,
-            }));
+            slf.waker = Some(Arc::new(AsyncioWaker { aio_loop, wrapper }));
             Ok(())
         })?;
 
@@ -66,7 +55,7 @@ impl PyAsyncProtocol for RustFutureWrapper {
 }
 
 #[pyproto]
-impl PyIterProtocol for RustFutureWrapper {
+impl PyIterProtocol for AwaitableRustFuture {
     fn __next__(mut slf: PyRefMut<Self>) -> PyResult<IterNextOutput<PyRefMut<Self>, PyObject>> {
         let mut future = slf.future.take().expect("no future");
         let waker = slf.waker.take().expect("no waker");
@@ -89,12 +78,12 @@ impl PyIterProtocol for RustFutureWrapper {
 
 #[pyclass]
 #[derive(Clone)]
-struct WakerClosure {
+struct AsyncioWaker {
     aio_loop: PyObject,
-    py_future: Py<RustFutureWrapper>,
+    wrapper: Py<AwaitableRustFuture>,
 }
 
-impl ArcWake for WakerClosure {
+impl ArcWake for AsyncioWaker {
     fn wake_by_ref(arc_self: &Arc<Self>) {
         let closure = (**arc_self).clone();
         Python::with_gil(|py| {
@@ -107,20 +96,20 @@ impl ArcWake for WakerClosure {
 }
 
 #[pymethods]
-impl WakerClosure {
+impl AsyncioWaker {
     #[call]
     pub fn __call__(slf: PyRef<Self>) -> PyResult<()> {
         let py = slf.py();
-        let mut py_future = slf.py_future.try_borrow_mut(py)?;
-        if py_future.callbacks.is_empty() {
+        let mut wrapper = slf.wrapper.try_borrow_mut(py)?;
+        if wrapper.callbacks.is_empty() {
             panic!("nothing to call back")
         }
-        let callbacks = std::mem::take(&mut py_future.callbacks);
+        let callbacks = std::mem::take(&mut wrapper.callbacks);
         for (callback, context) in callbacks {
             slf.aio_loop.call_method(
                 py,
                 "call_soon",
-                (callback, &py_future),
+                (callback, &wrapper),
                 Some(vec![("context", context)].into_py_dict(py)),
             )?;
         }
@@ -129,7 +118,7 @@ impl WakerClosure {
 }
 
 #[pymethods]
-impl RustFutureWrapper {
+impl AwaitableRustFuture {
     fn get_loop(&self) -> Option<&PyObject> {
         self.aio_loop.as_ref()
     }
@@ -143,28 +132,16 @@ impl RustFutureWrapper {
     }
 }
 
-pub trait PyAwaitable:
-    IntoPyCallbackOutput<*mut pyo3::ffi::PyObject> + PyAsyncProtocol<'static> + PyIterProtocol<'static>
+impl<T: Future<Output = impl IntoPyCallbackOutput<PyObject>> + Send + 'static> From<T>
+    for AwaitableRustFuture
 {
-}
-
-impl<T> PyAwaitable for T where
-    T: IntoPyCallbackOutput<*mut pyo3::ffi::PyObject>
-        + PyAsyncProtocol<'static>
-        + PyIterProtocol<'static>
-{
-}
-
-pub trait IntoPyAwaitable<'p> {
-    type Result: PyAwaitable;
-    fn into_awaitable(self) -> Self::Result;
-}
-
-impl<T: Future<Output = impl IntoPyCallbackOutput<PyObject>> + Send + 'static> IntoPyAwaitable<'_>
-    for T
-{
-    type Result = RustFutureWrapper;
-    fn into_awaitable(self) -> Self::Result {
-        RustFutureWrapper::new(self)
+    fn from(future: T) -> AwaitableRustFuture {
+        AwaitableRustFuture::new(
+            async move {
+                let result = future.await;
+                Python::with_gil(move |py| result.convert(py))
+            }
+            .boxed(),
+        )
     }
 }
