@@ -18,4 +18,4 @@ Although `pyo3-asyncio` achieves runtime agnosticity through generics (you can c
 
 ## Examples
 
-[`sterling`](https://gitlab.com/ThibaultLemaire/sterling) is an async MongoDB client for Python that I'm developing as an example of using this crate to build async Python libraries.
+[`stirling`](https://gitlab.com/ThibaultLemaire/stirling) is an async MongoDB client for Python that I'm developing as an example of using this crate to build async Python libraries.
