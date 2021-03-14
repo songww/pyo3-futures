@@ -4,18 +4,19 @@ use {
         task::{waker_ref, ArcWake},
     },
     pyo3::{
-        callback::IntoPyCallbackOutput, iter::IterNextOutput, prelude::*, types::IntoPyDict,
+        callback::IntoPyCallbackOutput, ffi, iter::IterNextOutput, prelude::*, types::IntoPyDict,
         PyAsyncProtocol, PyIterProtocol,
     },
     std::{
         future::Future,
+        marker::PhantomData,
         sync::Arc,
         task::{Context, Poll},
     },
 };
 
 #[pyclass]
-pub struct AwaitableRustFuture {
+struct AwaitableRustFuture {
     future: Option<BoxFuture<'static, PyResult<PyObject>>>,
     aio_loop: Option<PyObject>,
     callbacks: Vec<(PyObject, Option<PyObject>)>,
@@ -98,7 +99,7 @@ impl ArcWake for AsyncioWaker {
 #[pymethods]
 impl AsyncioWaker {
     #[call]
-    pub fn __call__(slf: PyRef<Self>) -> PyResult<()> {
+    fn __call__(slf: PyRef<Self>) -> PyResult<()> {
         let py = slf.py();
         let mut wrapper = slf.wrapper.try_borrow_mut(py)?;
         if wrapper.callbacks.is_empty() {
@@ -132,10 +133,12 @@ impl AwaitableRustFuture {
     }
 }
 
-impl<T: Future<Output = impl IntoPyCallbackOutput<PyObject>> + Send + 'static> From<T>
-    for AwaitableRustFuture
+impl<TFuture, TOutput> From<TFuture> for AwaitableRustFuture
+where
+    TFuture: Future<Output = TOutput> + Send + 'static,
+    TOutput: IntoPyCallbackOutput<PyObject>,
 {
-    fn from(future: T) -> AwaitableRustFuture {
+    fn from(future: TFuture) -> AwaitableRustFuture {
         AwaitableRustFuture::new(
             async move {
                 let result = future.await;
@@ -143,5 +146,26 @@ impl<T: Future<Output = impl IntoPyCallbackOutput<PyObject>> + Send + 'static> F
             }
             .boxed(),
         )
+    }
+}
+
+pub struct PyAsync<T>(AwaitableRustFuture, PhantomData<T>);
+
+impl<TFuture, TOutput> From<TFuture> for PyAsync<TOutput>
+where
+    TFuture: Future<Output = TOutput> + Send + 'static,
+    TOutput: IntoPyCallbackOutput<PyObject>,
+{
+    fn from(future: TFuture) -> Self {
+        Self(future.into(), PhantomData)
+    }
+}
+
+impl<TOutput> IntoPyCallbackOutput<*mut ffi::PyObject> for PyAsync<TOutput>
+where
+    TOutput: IntoPyCallbackOutput<PyObject>,
+{
+    fn convert(self, py: Python) -> PyResult<*mut ffi::PyObject> {
+        self.0.convert(py)
     }
 }
