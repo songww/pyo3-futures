@@ -64,14 +64,14 @@ struct AwaitableRustFuture {
 }
 
 impl AwaitableRustFuture {
-    fn new(future: BoxFuture<'static, PyResult<PyObject>>) -> Self {
-        Self {
-            future: Some(future),
+    fn new(future: impl Into<BoxFuture<'static, PyResult<PyObject>>>) -> PyResult<Self> {
+        Ok(Self {
+            future: Some(future.into()),
             aio_loop: None,
             callbacks: vec![],
             _asyncio_future_blocking: true,
             waker: None,
-        }
+        })
     }
 }
 
@@ -169,13 +169,15 @@ impl AwaitableRustFuture {
     }
 }
 
-impl<TFuture, TOutput> From<TFuture> for AwaitableRustFuture
+struct PySendableFuture(BoxFuture<'static, PyResult<PyObject>>);
+
+impl<TFuture, TOutput> From<TFuture> for PySendableFuture
 where
     TFuture: Future<Output = TOutput> + Send + 'static,
     TOutput: IntoPyCallbackOutput<PyObject>,
 {
-    fn from(future: TFuture) -> AwaitableRustFuture {
-        AwaitableRustFuture::new(
+    fn from(future: TFuture) -> Self {
+        Self(
             async move {
                 let result = future.await;
                 Python::with_gil(move |py| result.convert(py))
@@ -185,7 +187,13 @@ where
     }
 }
 
-pub struct PyAsync<T>(AwaitableRustFuture, PhantomData<T>);
+impl From<PySendableFuture> for BoxFuture<'static, PyResult<PyObject>> {
+    fn from(wrapper: PySendableFuture) -> Self {
+        wrapper.0
+    }
+}
+
+pub struct PyAsync<T>(PySendableFuture, PhantomData<T>);
 
 impl<TFuture, TOutput> From<TFuture> for PyAsync<TOutput>
 where
@@ -202,6 +210,6 @@ where
     TOutput: IntoPyCallbackOutput<PyObject>,
 {
     fn convert(self, py: Python) -> PyResult<*mut ffi::PyObject> {
-        self.0.convert(py)
+        AwaitableRustFuture::new(self.0).convert(py)
     }
 }
