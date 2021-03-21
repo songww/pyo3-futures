@@ -3,6 +3,7 @@ use {
         future::{BoxFuture, FutureExt},
         task::{waker_ref, ArcWake},
     },
+    once_cell::sync::OnceCell,
     pyo3::{
         callback::IntoPyCallbackOutput, ffi, iter::IterNextOutput, prelude::*, types::IntoPyDict,
         PyAsyncProtocol, PyIterProtocol,
@@ -14,6 +15,43 @@ use {
         task::{Context, Poll},
     },
 };
+
+fn asyncio(py: Python) -> PyResult<&Py<PyModule>> {
+    static ASYNCIO: OnceCell<Py<PyModule>> = OnceCell::new();
+    ASYNCIO.get_or_try_init(|| Ok(PyModule::import(py, "asyncio")?.into()))
+}
+
+fn register_task(py: Python, task: PyObject) -> PyResult<()> {
+    static REGISTER_TASK: OnceCell<PyObject> = OnceCell::new();
+    REGISTER_TASK
+        .get_or_try_init::<_, PyErr>(|| Ok(asyncio(py)?.getattr(py, "_register_task")?))?
+        .call1(py, (task,))?;
+    Ok(())
+}
+
+fn enter_task(py: Python, loop_: PyObject, task: PyObject) -> PyResult<()> {
+    static ENTER_TASK: OnceCell<PyObject> = OnceCell::new();
+    ENTER_TASK
+        .get_or_try_init::<_, PyErr>(|| Ok(asyncio(py)?.getattr(py, "_enter_task")?))?
+        .call1(py, (loop_, task))?;
+    Ok(())
+}
+
+fn leave_task(py: Python, loop_: PyObject, task: PyObject) -> PyResult<()> {
+    static LEAVE_TASK: OnceCell<PyObject> = OnceCell::new();
+    LEAVE_TASK
+        .get_or_try_init::<_, PyErr>(|| Ok(asyncio(py)?.getattr(py, "_leave_task")?))?
+        .call1(py, (loop_, task))?;
+    Ok(())
+}
+
+fn get_running_loop(py: Python) -> PyResult<PyObject> {
+    static GET_RUNNING_LOOP: OnceCell<PyObject> = OnceCell::new();
+    Ok(GET_RUNNING_LOOP
+        .get_or_try_init::<_, PyErr>(|| Ok(asyncio(py)?.getattr(py, "get_running_loop")?))?
+        .call0(py)?
+        .into())
+}
 
 #[pyclass]
 struct AwaitableRustFuture {
@@ -43,9 +81,7 @@ impl PyAsyncProtocol for AwaitableRustFuture {
         let wrapper = slf.clone();
         Python::with_gil(|py| -> PyResult<_> {
             let mut slf = slf.try_borrow_mut(py)?;
-            let aio_loop: PyObject = PyModule::import(py, "asyncio")?
-                .call0("get_running_loop")?
-                .into();
+            let aio_loop = get_running_loop(py)?;
             slf.aio_loop = Some(aio_loop.clone());
             slf.waker = Some(Arc::new(AsyncioWaker { aio_loop, wrapper }));
             Ok(())
