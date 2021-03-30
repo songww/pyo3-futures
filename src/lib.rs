@@ -5,8 +5,8 @@ use {
     },
     once_cell::sync::OnceCell,
     pyo3::{
-        callback::IntoPyCallbackOutput, ffi, iter::IterNextOutput, prelude::*, types::IntoPyDict,
-        PyAsyncProtocol, PyIterProtocol,
+        callback::IntoPyCallbackOutput, ffi, iter::IterNextOutput, prelude::*,
+        type_object::PyTypeObject, types::IntoPyDict, PyAsyncProtocol, PyIterProtocol,
     },
     std::{
         future::Future,
@@ -16,33 +16,20 @@ use {
     },
 };
 
+fn monkey_patch_ourselves_into_accepted_coro_types(py: Python) -> PyResult<&()> {
+    static MONKEY_PATCHED: OnceCell<()> = OnceCell::new();
+    MONKEY_PATCHED.get_or_try_init(|| {
+        let coroutines = PyModule::import(py, "asyncio.coroutines")?;
+        let typecache_set: &pyo3::types::PySet =
+            coroutines.getattr("_iscoroutine_typecache")?.extract()?;
+        typecache_set.add(AwaitableRustFuture::type_object(py))?;
+        Ok(())
+    })
+}
+
 fn asyncio(py: Python) -> PyResult<&Py<PyModule>> {
     static ASYNCIO: OnceCell<Py<PyModule>> = OnceCell::new();
     ASYNCIO.get_or_try_init(|| Ok(PyModule::import(py, "asyncio")?.into()))
-}
-
-fn register_task(py: Python, task: PyObject) -> PyResult<()> {
-    static REGISTER_TASK: OnceCell<PyObject> = OnceCell::new();
-    REGISTER_TASK
-        .get_or_try_init::<_, PyErr>(|| Ok(asyncio(py)?.getattr(py, "_register_task")?))?
-        .call1(py, (task,))?;
-    Ok(())
-}
-
-fn enter_task(py: Python, loop_: PyObject, task: PyObject) -> PyResult<()> {
-    static ENTER_TASK: OnceCell<PyObject> = OnceCell::new();
-    ENTER_TASK
-        .get_or_try_init::<_, PyErr>(|| Ok(asyncio(py)?.getattr(py, "_enter_task")?))?
-        .call1(py, (loop_, task))?;
-    Ok(())
-}
-
-fn leave_task(py: Python, loop_: PyObject, task: PyObject) -> PyResult<()> {
-    static LEAVE_TASK: OnceCell<PyObject> = OnceCell::new();
-    LEAVE_TASK
-        .get_or_try_init::<_, PyErr>(|| Ok(asyncio(py)?.getattr(py, "_leave_task")?))?
-        .call1(py, (loop_, task))?;
-    Ok(())
 }
 
 fn get_running_loop(py: Python) -> PyResult<PyObject> {
@@ -69,7 +56,7 @@ impl AwaitableRustFuture {
             future: Some(future),
             aio_loop: None,
             callbacks: vec![],
-            _asyncio_future_blocking: true,
+            _asyncio_future_blocking: false,
             waker: None,
         }
     }
@@ -164,6 +151,24 @@ impl AwaitableRustFuture {
         self.callbacks.push((callback, context));
     }
 
+    /// https://docs.python.org/3/reference/datamodel.html#coroutine.send
+    fn send(slf: Py<Self>, value: Option<&PyAny>) -> PyResult<IterNextOutput<PyObject, PyObject>> {
+        if value.is_some() {
+            panic!("sending a value is unsupported")
+        }
+        Python::with_gil(move |py| {
+            if slf.try_borrow_mut(py)?.aio_loop.is_none() {
+                Self::__await__(slf.clone())?;
+            }
+            Self::__next__(slf.try_borrow_mut(py)?).map(|output| output.convert(py))
+        })?
+    }
+
+    /// https://docs.python.org/3/reference/datamodel.html#coroutine.throw
+    fn throw(slf: Py<Self>, type_: &PyAny, exc: Option<&PyAny>, traceback: Option<&PyAny>) {
+        panic!("throw({:?}, {:?}, {:?})", type_, exc, traceback);
+    }
+
     fn result(&self) -> Option<PyObject> {
         None
     }
@@ -202,6 +207,7 @@ where
     TOutput: IntoPyCallbackOutput<PyObject>,
 {
     fn convert(self, py: Python) -> PyResult<*mut ffi::PyObject> {
+        monkey_patch_ourselves_into_accepted_coro_types(py)?;
         self.0.convert(py)
     }
 }
