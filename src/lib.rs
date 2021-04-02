@@ -11,6 +11,7 @@ use {
     std::{
         future::Future,
         marker::PhantomData,
+        mem,
         sync::Arc,
         task::{Context, Poll},
     },
@@ -22,7 +23,7 @@ fn monkey_patch_ourselves_into_accepted_coro_types(py: Python) -> PyResult<&()> 
         let coroutines = PyModule::import(py, "asyncio.coroutines")?;
         let typecache_set: &pyo3::types::PySet =
             coroutines.getattr("_iscoroutine_typecache")?.extract()?;
-        typecache_set.add(AwaitableRustFuture::type_object(py))?;
+        typecache_set.add(RustTask::type_object(py))?;
         Ok(())
     })
 }
@@ -40,56 +41,45 @@ fn get_running_loop(py: Python) -> PyResult<PyObject> {
         .into())
 }
 
-#[pyclass]
-struct AwaitableRustFuture {
-    future: Option<BoxFuture<'static, PyResult<PyObject>>>,
-    aio_loop: Option<PyObject>,
+enum FutureState {
+    Cancelled,
+    Pending {
+        future: BoxFuture<'static, PyResult<PyObject>>,
+        waker: Arc<AsyncioWaker>,
+    },
+    Executing,
+}
+
+#[pyclass(weakref)]
+struct RustTask {
+    future: FutureState,
+    aio_loop: PyObject,
     callbacks: Vec<(PyObject, Option<PyObject>)>,
     #[pyo3(get, set)]
     _asyncio_future_blocking: bool,
-    waker: Option<Arc<AsyncioWaker>>,
 }
 
-impl AwaitableRustFuture {
-    fn new(future: BoxFuture<'static, PyResult<PyObject>>) -> Self {
-        Self {
-            future: Some(future),
-            aio_loop: None,
-            callbacks: vec![],
-            _asyncio_future_blocking: false,
-            waker: None,
-        }
+#[pyproto]
+impl PyAsyncProtocol for RustTask {
+    fn __await__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
     }
 }
 
 #[pyproto]
-impl PyAsyncProtocol for AwaitableRustFuture {
-    fn __await__(slf: Py<Self>) -> PyResult<Py<Self>> {
-        let wrapper = slf.clone();
-        Python::with_gil(|py| -> PyResult<_> {
-            let mut slf = slf.try_borrow_mut(py)?;
-            let aio_loop = get_running_loop(py)?;
-            slf.aio_loop = Some(aio_loop.clone());
-            slf.waker = Some(Arc::new(AsyncioWaker { aio_loop, wrapper }));
-            Ok(())
-        })?;
-
-        Ok(slf)
-    }
-}
-
-#[pyproto]
-impl PyIterProtocol for AwaitableRustFuture {
+impl PyIterProtocol for RustTask {
     fn __next__(mut slf: PyRefMut<Self>) -> PyResult<IterNextOutput<PyRefMut<Self>, PyObject>> {
-        let mut future = slf.future.take().expect("no future");
-        let waker = slf.waker.take().expect("no waker");
-        let result = slf.py().allow_threads(|| {
-            let waker_ref = waker_ref(&waker);
-            let context = &mut Context::from_waker(&*waker_ref);
-            future.as_mut().poll(context)
-        });
-        slf.future = Some(future);
-        slf.waker = Some(waker);
+        let mut execution_slot = FutureState::Executing;
+        mem::swap(&mut execution_slot, &mut slf.future);
+        let result = match &mut execution_slot {
+            FutureState::Pending { future, waker } => slf.py().allow_threads(|| {
+                let waker_ref = waker_ref(&waker);
+                let context = &mut Context::from_waker(&*waker_ref);
+                future.as_mut().poll(context)
+            }),
+            _ => unimplemented!(),
+        };
+        mem::swap(&mut execution_slot, &mut slf.future);
         match result {
             Poll::Pending => {
                 slf._asyncio_future_blocking = true;
@@ -104,7 +94,7 @@ impl PyIterProtocol for AwaitableRustFuture {
 #[derive(Clone)]
 struct AsyncioWaker {
     aio_loop: PyObject,
-    wrapper: Py<AwaitableRustFuture>,
+    wrapper: Py<RustTask>,
 }
 
 impl ArcWake for AsyncioWaker {
@@ -124,7 +114,7 @@ impl AsyncioWaker {
     #[call]
     fn __call__(slf: PyRef<Self>) -> PyResult<()> {
         let py = slf.py();
-        let mut wrapper = slf.wrapper.try_borrow_mut(py)?;
+        let mut wrapper = slf.wrapper.try_borrow_mut(py)?; // TODO: Try moving the callbacks to the waker
         if wrapper.callbacks.is_empty() {
             panic!("nothing to call back")
         }
@@ -142,9 +132,9 @@ impl AsyncioWaker {
 }
 
 #[pymethods]
-impl AwaitableRustFuture {
-    fn get_loop(&self) -> Option<&PyObject> {
-        self.aio_loop.as_ref()
+impl RustTask {
+    fn get_loop(&self) -> &PyObject {
+        &self.aio_loop
     }
 
     fn add_done_callback(&mut self, callback: PyObject, context: Option<PyObject>) {
@@ -152,16 +142,14 @@ impl AwaitableRustFuture {
     }
 
     /// https://docs.python.org/3/reference/datamodel.html#coroutine.send
-    fn send(slf: Py<Self>, value: Option<&PyAny>) -> PyResult<IterNextOutput<PyObject, PyObject>> {
+    fn send(
+        slf: PyRefMut<Self>,
+        value: Option<&PyAny>,
+    ) -> PyResult<IterNextOutput<PyObject, PyObject>> {
         if value.is_some() {
-            panic!("sending a value is unsupported")
+            unimplemented!();
         }
-        Python::with_gil(move |py| {
-            if slf.try_borrow_mut(py)?.aio_loop.is_none() {
-                Self::__await__(slf.clone())?;
-            }
-            Self::__next__(slf.try_borrow_mut(py)?).map(|output| output.convert(py))
-        })?
+        Python::with_gil(|py| Self::__next__(slf).convert(py))
     }
 
     /// https://docs.python.org/3/reference/datamodel.html#coroutine.throw
@@ -169,18 +157,18 @@ impl AwaitableRustFuture {
         panic!("throw({:?}, {:?}, {:?})", type_, exc, traceback);
     }
 
-    fn result(&self) -> Option<PyObject> {
-        None
-    }
+    fn result(&self) {}
 }
 
-impl<TFuture, TOutput> From<TFuture> for AwaitableRustFuture
+struct PySendableFuture(BoxFuture<'static, PyResult<PyObject>>);
+
+impl<TFuture, TOutput> From<TFuture> for PySendableFuture
 where
     TFuture: Future<Output = TOutput> + Send + 'static,
     TOutput: IntoPyCallbackOutput<PyObject>,
 {
-    fn from(future: TFuture) -> AwaitableRustFuture {
-        AwaitableRustFuture::new(
+    fn from(future: TFuture) -> Self {
+        Self(
             async move {
                 let result = future.await;
                 Python::with_gil(move |py| result.convert(py))
@@ -190,7 +178,13 @@ where
     }
 }
 
-pub struct PyAsync<T>(AwaitableRustFuture, PhantomData<T>);
+impl From<PySendableFuture> for BoxFuture<'static, PyResult<PyObject>> {
+    fn from(wrapper: PySendableFuture) -> Self {
+        wrapper.0
+    }
+}
+
+pub struct PyAsync<T>(PySendableFuture, PhantomData<T>);
 
 impl<TFuture, TOutput> From<TFuture> for PyAsync<TOutput>
 where
@@ -208,6 +202,24 @@ where
 {
     fn convert(self, py: Python) -> PyResult<*mut ffi::PyObject> {
         monkey_patch_ourselves_into_accepted_coro_types(py)?;
-        self.0.convert(py)
+        let aio_loop = get_running_loop(py)?;
+        let task_like = Py::new(
+            py,
+            RustTask {
+                future: FutureState::Cancelled,
+                aio_loop: aio_loop.clone(),
+                callbacks: vec![],
+                _asyncio_future_blocking: false,
+            },
+        )?;
+        let wrapper = task_like.clone();
+        task_like.try_borrow_mut(py)?.future = FutureState::Pending {
+            future: self.0.into(),
+            waker: Arc::new(AsyncioWaker {
+                aio_loop: aio_loop,
+                wrapper,
+            }),
+        };
+        task_like.convert(py)
     }
 }
