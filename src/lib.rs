@@ -23,7 +23,7 @@ fn monkey_patch_ourselves_into_accepted_coro_types(py: Python) -> PyResult<&()> 
         let coroutines = PyModule::import(py, "asyncio.coroutines")?;
         let typecache_set: &pyo3::types::PySet =
             coroutines.getattr("_iscoroutine_typecache")?.extract()?;
-        typecache_set.add(RustTask::type_object(py))?;
+        typecache_set.add(Rustine::type_object(py))?;
         Ok(())
     })
 }
@@ -50,8 +50,9 @@ enum FutureState {
     Executing,
 }
 
-#[pyclass(weakref)]
-struct RustTask {
+/// Rust Coroutine
+#[pyclass(weakref, module = "pyo3_futures")]
+struct Rustine {
     future: FutureState,
     aio_loop: PyObject,
     callbacks: Vec<(PyObject, Option<PyObject>)>,
@@ -60,14 +61,14 @@ struct RustTask {
 }
 
 #[pyproto]
-impl PyAsyncProtocol for RustTask {
+impl PyAsyncProtocol for Rustine {
     fn __await__(slf: PyRef<Self>) -> PyRef<Self> {
         slf
     }
 }
 
 #[pyproto]
-impl PyIterProtocol for RustTask {
+impl PyIterProtocol for Rustine {
     fn __next__(mut slf: PyRefMut<Self>) -> PyResult<IterNextOutput<PyRefMut<Self>, PyObject>> {
         let mut execution_slot = FutureState::Executing;
         mem::swap(&mut execution_slot, &mut slf.future);
@@ -94,7 +95,7 @@ impl PyIterProtocol for RustTask {
 #[derive(Clone)]
 struct AsyncioWaker {
     aio_loop: PyObject,
-    wrapper: Py<RustTask>,
+    rustine: Py<Rustine>,
 }
 
 impl ArcWake for AsyncioWaker {
@@ -114,16 +115,16 @@ impl AsyncioWaker {
     #[call]
     fn __call__(slf: PyRef<Self>) -> PyResult<()> {
         let py = slf.py();
-        let mut wrapper = slf.wrapper.try_borrow_mut(py)?; // TODO: Try moving the callbacks to the waker
-        if wrapper.callbacks.is_empty() {
+        let mut rustine = slf.rustine.try_borrow_mut(py)?; // TODO: Try moving the callbacks to the waker
+        if rustine.callbacks.is_empty() {
             panic!("nothing to call back")
         }
-        let callbacks = std::mem::take(&mut wrapper.callbacks);
+        let callbacks = std::mem::take(&mut rustine.callbacks);
         for (callback, context) in callbacks {
             slf.aio_loop.call_method(
                 py,
                 "call_soon",
-                (callback, &wrapper),
+                (callback, &rustine),
                 Some(vec![("context", context)].into_py_dict(py)),
             )?;
         }
@@ -132,7 +133,7 @@ impl AsyncioWaker {
 }
 
 #[pymethods]
-impl RustTask {
+impl Rustine {
     fn get_loop(&self) -> &PyObject {
         &self.aio_loop
     }
@@ -179,8 +180,8 @@ where
 }
 
 impl From<PySendableFuture> for BoxFuture<'static, PyResult<PyObject>> {
-    fn from(wrapper: PySendableFuture) -> Self {
-        wrapper.0
+    fn from(rustine: PySendableFuture) -> Self {
+        rustine.0
     }
 }
 
@@ -203,23 +204,23 @@ where
     fn convert(self, py: Python) -> PyResult<*mut ffi::PyObject> {
         monkey_patch_ourselves_into_accepted_coro_types(py)?;
         let aio_loop = get_running_loop(py)?;
-        let task_like = Py::new(
+        let rustine = Py::new(
             py,
-            RustTask {
+            Rustine {
                 future: FutureState::Cancelled,
                 aio_loop: aio_loop.clone(),
                 callbacks: vec![],
                 _asyncio_future_blocking: false,
             },
         )?;
-        let wrapper = task_like.clone();
-        task_like.try_borrow_mut(py)?.future = FutureState::Pending {
+        let clone = rustine.clone();
+        rustine.try_borrow_mut(py)?.future = FutureState::Pending {
             future: self.0.into(),
             waker: Arc::new(AsyncioWaker {
-                aio_loop: aio_loop,
-                wrapper,
+                aio_loop,
+                rustine: clone,
             }),
         };
-        task_like.convert(py)
+        rustine.convert(py)
     }
 }
