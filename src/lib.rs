@@ -5,8 +5,9 @@ use {
     },
     once_cell::sync::OnceCell,
     pyo3::{
-        callback::IntoPyCallbackOutput, ffi, iter::IterNextOutput, prelude::*,
-        type_object::PyTypeObject, types::IntoPyDict, PyAsyncProtocol, PyIterProtocol,
+        callback::IntoPyCallbackOutput, exceptions::asyncio::CancelledError, ffi,
+        iter::IterNextOutput, prelude::*, type_object::PyTypeObject, types::IntoPyDict,
+        PyAsyncProtocol, PyIterProtocol,
     },
     std::{
         future::Future,
@@ -39,6 +40,10 @@ fn get_running_loop(py: Python) -> PyResult<PyObject> {
         .get_or_try_init::<_, PyErr>(|| Ok(asyncio(py)?.getattr(py, "get_running_loop")?))?
         .call0(py)?
         .into())
+}
+
+fn cancelled_error() -> PyErr {
+    CancelledError::new_err("Rustine cancelled")
 }
 
 enum FutureState {
@@ -78,6 +83,7 @@ impl PyIterProtocol for Rustine {
                 let context = &mut Context::from_waker(&*waker_ref);
                 future.as_mut().poll(context)
             }),
+            FutureState::Cancelled => Poll::Ready(Err(cancelled_error())),
             _ => unimplemented!(),
         };
         mem::swap(&mut execution_slot, &mut slf.future);
@@ -114,21 +120,7 @@ impl ArcWake for AsyncioWaker {
 impl AsyncioWaker {
     #[call]
     fn __call__(slf: PyRef<Self>) -> PyResult<()> {
-        let py = slf.py();
-        let mut rustine = slf.rustine.try_borrow_mut(py)?; // TODO: Try moving the callbacks to the waker
-        if rustine.callbacks.is_empty() {
-            panic!("nothing to call back")
-        }
-        let callbacks = std::mem::take(&mut rustine.callbacks);
-        for (callback, context) in callbacks {
-            slf.aio_loop.call_method(
-                py,
-                "call_soon",
-                (callback, &rustine),
-                Some(vec![("context", context)].into_py_dict(py)),
-            )?;
-        }
-        Ok(())
+        Rustine::schedule_callbacks(slf.rustine.try_borrow_mut(slf.py())?)
     }
 }
 
@@ -158,7 +150,48 @@ impl Rustine {
         panic!("throw({:?}, {:?}, {:?})", type_, exc, traceback);
     }
 
-    fn result(&self) {}
+    /// https://docs.python.org/3/library/asyncio-future.html?highlight=asyncio%20future#asyncio.Future.result
+    fn result(&self) -> PyResult<Option<PyObject>> {
+        match self.future {
+            FutureState::Cancelled => Err(cancelled_error()),
+            FutureState::Pending { .. } => Ok(None),
+            _ => unimplemented!(),
+        }
+    }
+
+    /// https://docs.python.org/3/library/asyncio-future.html?highlight=asyncio%20future#asyncio.Future.cancel
+    fn cancel(mut slf: PyRefMut<Self>) -> PyResult<()> {
+        slf.future = FutureState::Cancelled;
+        Rustine::schedule_callbacks(slf)
+    }
+
+    /// https://docs.python.org/3/library/asyncio-future.html?highlight=asyncio%20future#asyncio.Future.cancelled
+    fn cancelled(&self) -> bool {
+        match self.future {
+            FutureState::Cancelled => true,
+            _ => false,
+        }
+    }
+}
+
+impl Rustine {
+    /// https://github.com/python/cpython/blob/17ef4319a34f5a2f95e7823dfb5f5b8cff11882d/Lib/asyncio/futures.py#L159
+    fn schedule_callbacks(mut slf: PyRefMut<Self>) -> PyResult<()> {
+        if slf.callbacks.is_empty() {
+            panic!("nothing to call back")
+        }
+        let callbacks = std::mem::take(&mut slf.callbacks);
+        let py = slf.py();
+        for (callback, context) in callbacks {
+            slf.aio_loop.call_method(
+                py,
+                "call_soon",
+                (callback, &slf),
+                Some(vec![("context", context)].into_py_dict(py)),
+            )?;
+        }
+        Ok(())
+    }
 }
 
 struct PySendableFuture(BoxFuture<'static, PyResult<PyObject>>);
