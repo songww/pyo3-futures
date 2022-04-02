@@ -14,7 +14,7 @@ use {
         pyasync::IterANextOutput,
         type_object::PyTypeObject,
         types::IntoPyDict,
-        PyAsyncProtocol, PyIterProtocol, PyTypeInfo,
+        PyTypeInfo,
     },
     std::{
         future::Future,
@@ -72,15 +72,38 @@ struct Rustine {
     _asyncio_future_blocking: bool,
 }
 
-#[pyproto]
-impl PyAsyncProtocol for Rustine {
-    fn __await__(slf: PyRef<Self>) -> PyRef<Self> {
-        slf
+#[pyclass(module = "pyo3_futures")]
+#[derive(Clone)]
+struct AsyncioWaker {
+    aio_loop: PyObject,
+    rustine: Py<Rustine>,
+}
+
+impl ArcWake for AsyncioWaker {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        let closure = (**arc_self).clone();
+        Python::with_gil(|py| {
+            arc_self
+                .aio_loop
+                .call_method1(py, "call_soon_threadsafe", (closure,))
+        })
+        .expect("exception thrown by the event loop (probably closed)");
     }
 }
 
-#[pyproto]
-impl PyIterProtocol for Rustine {
+#[pymethods]
+impl AsyncioWaker {
+    fn __call__(slf: PyRef<Self>) -> PyResult<()> {
+        Rustine::schedule_callbacks(slf.rustine.try_borrow_mut(slf.py())?)
+    }
+}
+
+#[pymethods]
+impl Rustine {
+    fn __await__(slf: PyRef<Self>) -> PyRef<Self> {
+        slf
+    }
+
     fn __next__(mut slf: PyRefMut<Self>) -> PyResult<IterNextOutput<PyRefMut<Self>, PyObject>> {
         let mut execution_slot = FutureState::Executing;
         mem::swap(&mut execution_slot, &mut slf.future);
@@ -102,37 +125,7 @@ impl PyIterProtocol for Rustine {
             Poll::Ready(result) => Ok(IterNextOutput::Return(result?)),
         }
     }
-}
 
-#[pyclass]
-#[derive(Clone)]
-struct AsyncioWaker {
-    aio_loop: PyObject,
-    rustine: Py<Rustine>,
-}
-
-impl ArcWake for AsyncioWaker {
-    fn wake_by_ref(arc_self: &Arc<Self>) {
-        let closure = (**arc_self).clone();
-        Python::with_gil(|py| {
-            arc_self
-                .aio_loop
-                .call_method1(py, "call_soon_threadsafe", (closure,))
-        })
-        .expect("exception thrown by the event loop (probably closed)");
-    }
-}
-
-#[pymethods]
-impl AsyncioWaker {
-    #[call]
-    fn __call__(slf: PyRef<Self>) -> PyResult<()> {
-        Rustine::schedule_callbacks(slf.rustine.try_borrow_mut(slf.py())?)
-    }
-}
-
-#[pymethods]
-impl Rustine {
     fn get_loop(&self) -> &PyObject {
         &self.aio_loop
     }
@@ -284,8 +277,8 @@ struct PowerDam {
     _asyncio_future_blocking: bool,
 }
 
-#[pyproto]
-impl PyAsyncProtocol for PowerDam {
+#[pymethods]
+impl PowerDam {
     fn __aiter__(slf: PyRef<Self>) -> PyRef<Self> {
         slf
     }
@@ -297,10 +290,7 @@ impl PyAsyncProtocol for PowerDam {
     fn __await__(slf: PyRef<Self>) -> PyRef<Self> {
         slf
     }
-}
 
-#[pyproto]
-impl PyIterProtocol for PowerDam {
     fn __next__(mut slf: PyRefMut<Self>) -> PyResult<IterNextOutput<PyRefMut<Self>, PyObject>> {
         let mut execution_slot = StreamState::Executing;
         mem::swap(&mut execution_slot, &mut slf.stream);
@@ -323,10 +313,7 @@ impl PyIterProtocol for PowerDam {
             Poll::Ready(None) => Err(PyStopAsyncIteration::new_err(())),
         }
     }
-}
 
-#[pymethods]
-impl PowerDam {
     fn get_loop(&self) -> &PyObject {
         &self.aio_loop
     }
@@ -395,7 +382,7 @@ impl PowerDam {
     }
 }
 
-#[pyclass]
+#[pyclass(module = "pyo3_futures")]
 #[derive(Clone)]
 struct PowerDamWaker {
     aio_loop: PyObject,
@@ -416,7 +403,6 @@ impl ArcWake for PowerDamWaker {
 
 #[pymethods]
 impl PowerDamWaker {
-    #[call]
     fn __call__(slf: PyRef<Self>) -> PyResult<()> {
         PowerDam::schedule_callbacks(slf.powerdam.try_borrow_mut(slf.py())?)
     }
